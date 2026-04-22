@@ -1,0 +1,210 @@
+import akshare as ak
+import pandas as pd
+import numpy as np
+from datetime import datetime, timedelta
+from tqdm import tqdm
+import warnings
+warnings.filterwarnings("ignore")
+
+# ===================== 全局配置参数（按需修改）=====================
+MARKET_VALUE_MIN = 50  # 最低总市值 50亿
+# 周度RPS周期（周数→交易日，A股每周5个交易日）
+WEEK_PERIODS = {
+    "4周RPS": 4 * 5,
+    "8周RPS": 8 * 5,
+    "12周RPS": 12 * 5,
+    "20周RPS": 20 * 5,
+    "32周RPS": 32 * 5
+}
+# 涨跌幅回溯天数
+RETURN_PERIODS = {
+    "近1年涨幅": 252,   # 自然年交易日
+    "近6月涨幅": 126,
+    "近3月涨幅": 63,
+    "近1月涨幅": 21
+}
+# 数据截止日期（今日）
+END_DATE = datetime.now().strftime("%Y%m%d")
+# 历史数据起始日（拉足1年+32周余量）
+START_DATE = (datetime.now() - timedelta(days=500)).strftime("%Y%m%d")
+
+# ===================== 1. 获取全A股实时行情+市值+行业信息 =====================
+def get_all_a_stocks():
+    # A股全部个股实时数据（含市值、代码、名称）
+    stock_spot = ak.stock_zh_a_spot_em()
+    # 字段重命名+筛选
+    df = stock_spot[["代码", "名称", "总市值", "最新价"]].copy()
+    df.rename(columns={"代码":"stock_code", "名称":"stock_name", "总市值":"market_value"}, inplace=True)
+    # 市值单位：万元→亿元
+    df["market_value"] = df["market_value"] / 10000
+    # 过滤：总市值≥50亿
+    df = df[df["market_value"] >= MARKET_VALUE_MIN].reset_index(drop=True)
+    
+    # 获取申万一级/二级/三级行业匹配（akshare申万行业接口）
+    stock_ind = ak.stock_board_industry_name_em()
+    ind_map = stock_ind[["股票代码", "行业", "二级行业", "三级行业"]].copy()
+    ind_map.rename(columns={"股票代码":"stock_code", "行业":"level1", "二级行业":"level2", "三级行业":"level3"}, inplace=True)
+    # 合并行业信息
+    df = pd.merge(df, ind_map, on="stock_code", how="left")
+    df = df.dropna(subset=["level1", "level2", "level3"]).reset_index(drop=True)
+    return df
+
+# ===================== 2. 计算个股多周期涨跌幅 =====================
+def calc_stock_return(close_series):
+    res = {}
+    for name, days in RETURN_PERIODS.items():
+        if len(close_series) > days:
+            ret = (close_series.iloc[-1] / close_series.iloc[-days-1] - 1) * 100
+        else:
+            ret = np.nan
+        res[name] = round(ret, 2)
+    return res
+
+# ===================== 3. 欧奈尔RPS核心计算函数（全市场相对强度）=====================
+def calc_rps_all_market(stock_df_dict, period_days):
+    """
+    批量计算所有个股N日RPS（相对全市场排名百分位）
+    stock_df_dict: {股票代码: 前复权日线DataFrame}
+    period_days: 回溯交易日
+    return: {股票代码: RPS值}
+    """
+    all_ret = {}
+    # 遍历所有个股，计算N日涨幅
+    for code, df in stock_df_dict.items():
+        close = df["收盘"].dropna()
+        if len(close) > period_days:
+            ret = close.iloc[-1] / close.iloc[-period_days-1] - 1
+            all_ret[code] = ret
+    # 全市场涨幅排序→百分位→映射RPS(0~100)
+    ret_series = pd.Series(all_ret).dropna()
+    rps_series = ret_series.rank(pct=True) * 100
+    return rps_series.round(2).to_dict()
+
+# ===================== 4. 批量拉取个股前复权日线数据 =====================
+def fetch_stock_daily(stock_code_list):
+    stock_data = {}
+    print("正在批量获取个股日线行情（前复权）...")
+    for code in tqdm(stock_code_list):
+        try:
+            df = ak.stock_zh_a_hist(
+                symbol=code,
+                period="daily",
+                start_date=START_DATE,
+                end_date=END_DATE,
+                adjust="qfq"  # 前复权，必须
+            )
+            df["日期"] = pd.to_datetime(df["日期"])
+            df = df.set_index("日期").sort_index()
+            stock_data[code] = df
+        except Exception as e:
+            continue
+    return stock_data
+
+# ===================== 5. 行业指数RPS计算（申万一二三行业）=====================
+def get_industry_rps():
+    """获取申万一级/二级/三级行业指数，计算全周期RPS"""
+    # 申万一级行业指数
+    ind1_df = ak.stock_board_industry_index_em()
+    ind1_list = ind1_df["板块代码"].tolist()
+    
+    ind_rps_result = []
+    print("正在计算行业指数RPS...")
+    # 行业日线+RPS批量计算
+    ind_data = {}
+    for ind_code in tqdm(ind1_list):
+        try:
+            df = ak.stock_board_industry_hist_em(
+                symbol=ind_code,
+                period="日k",
+                start_date=START_DATE,
+                end_date=END_DATE,
+                adjust="qfq"
+            )
+            df["日期"] = pd.to_datetime(df["日期"])
+            df = df.set_index("日期").sort_index()
+            ind_data[ind_code] = df
+        except:
+            continue
+    
+    # 行业全周期涨幅+RPS
+    ind_all_ret = {}
+    for ind_code, df in ind_data.items():
+        close = df["收盘"].dropna()
+        temp = {}
+        # 行业涨跌幅
+        for ret_name, days in RETURN_PERIODS.items():
+            if len(close) > days:
+                temp[ret_name] = round((close.iloc[-1]/close.iloc[-days-1]-1)*100,2)
+            else:
+                temp[ret_name] = np.nan
+        # 行业各周期RPS
+        for rps_name, days in WEEK_PERIODS.items():
+            if len(close) > days:
+                temp[rps_name] = close.iloc[-1]/close.iloc[-days-1]-1
+            else:
+                temp[rps_name] = np.nan
+        ind_all_ret[ind_code] = temp
+    
+    # 行业涨幅排序计算RPS（同个股全市场基准）
+    industry_df = pd.DataFrame.from_dict(ind_all_ret, orient="index")
+    ind_rps_final = []
+    for rps_name, days in WEEK_PERIODS.items():
+        ser = industry_df[rps_name].dropna()
+        rps = ser.rank(pct=True)*100
+        industry_df[rps_name] = rps.round(2)
+    # 合并行业名称
+    name_map = ind1_df[["板块代码", "板块名称"]].set_index("板块代码")["板块名称"]
+    industry_df["行业名称"] = industry_df.index.map(name_map)
+    industry_df = industry_df.reset_index().rename(columns={"index":"行业代码"})
+    return industry_df
+
+# ===================== 6. 主程序入口（全套运行）=====================
+def main():
+    # Step1：筛选50亿以上个股+行业
+    print("===== 第一步：筛选A股总市值≥50亿个股 =====")
+    stock_base = get_all_a_stocks()
+    stock_code_list = stock_base["stock_code"].tolist()
+    print(f"筛选完成，有效个股数量：{len(stock_code_list)}")
+
+    # Step2：批量拉取所有个股前复权日线
+    stock_daily_dict = fetch_stock_daily(stock_code_list)
+    valid_codes = list(stock_daily_dict.keys())
+    stock_base = stock_base[stock_base["stock_code"].isin(valid_codes)].reset_index(drop=True)
+
+    # Step3：计算个股多周期涨跌幅
+    print("===== 第二步：计算个股近1年/6月/3月/1月涨幅 =====")
+    return_list = []
+    for code in valid_codes:
+        close = stock_daily_dict[code]["收盘"].dropna()
+        ret_dict = calc_stock_return(close)
+        ret_dict["stock_code"] = code
+        return_list.append(ret_dict)
+    ret_df = pd.DataFrame(return_list)
+    stock_base = pd.merge(stock_base, ret_df, on="stock_code", how="left")
+
+    # Step4：计算个股4/8/12/20/32周RPS
+    print("===== 第三步：计算个股周度RPS（4/8/12/20/32周）=====")
+    rps_all = {}
+    for rps_name, days in WEEK_PERIODS.items():
+        rps_dict = calc_rps_all_market(stock_daily_dict, days)
+        rps_df = pd.DataFrame(list(rps_dict.items()), columns=["stock_code", rps_name])
+        rps_all[rps_name] = rps_df
+    # 合并所有RPS到个股总表
+    for df in rps_all.values():
+        stock_base = pd.merge(stock_base, df, on="stock_code", how="left")
+
+    # Step5：计算申万一二三行业RPS全套指标
+    print("===== 第四步：计算一级/二级/三级行业周度RPS =====")
+    industry_result = get_industry_rps()
+
+    # Step6：导出Excel（分2个Sheet：个股表、行业表）
+    save_path = f"A股50亿以上个股+多周期涨幅+周度RPS_{END_DATE}.xlsx"
+    with pd.ExcelWriter(save_path, engine="openpyxl") as writer:
+        stock_base.to_excel(writer, sheet_name="个股数据总表", index=False)
+        industry_result.to_excel(writer, sheet_name="行业RPS数据", index=False)
+    print(f"\n===== 全部计算完成！文件已保存至：{save_path} =====")
+    print("【个股表字段】：代码、名称、市值、一二三行业、近1/6/3/1月涨幅、4/8/12/20/32周RPS")
+    print("【行业表字段】：行业代码、行业名称、行业涨幅、4/8/12/20/32周行业RPS")
+
+if __name__ == "__main__":
+    main()
